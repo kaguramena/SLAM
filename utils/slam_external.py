@@ -153,8 +153,15 @@ def remove_points(to_remove, params, variables, optimizer):
             group["params"][0] = torch.nn.Parameter(group["params"][0][to_keep].requires_grad_(True))
             params[k] = group["params"][0]
     variables['means2D_gradient_accum'] = variables['means2D_gradient_accum'][to_keep]
+    variables['seen'] = variables['seen'][to_keep]
     variables['denom'] = variables['denom'][to_keep]
     variables['max_2D_radius'] = variables['max_2D_radius'][to_keep]
+    original_grad = variables['means2D'].grad.clone()
+    # 执行筛选
+    variables['means2D'] = variables['means2D'][to_keep]
+    # 重新附加梯度
+    if original_grad is not None:
+        variables['means2D'].grad = original_grad[to_keep]
     if 'timestep' in variables.keys():
         variables['timestep'] = variables['timestep'][to_keep]
     return params, variables
@@ -286,3 +293,22 @@ def get_expon_lr_func(
         return delay_rate * log_lerp
 
     return helper
+
+
+def rgb_to_grayscale(img):
+    r, g, b = img[:, 0, :, :], img[:, 1, :, :], img[:, 2, :, :]
+    gray_img = 0.2989 * r + 0.5870 * g + 0.1140 * b
+    return gray_img.unsqueeze(1)  # Add channel dimension
+
+def sobel_operator(img):
+    # Convert RGB to grayscale
+    gray_img = rgb_to_grayscale(img)
+
+    sobel_kernel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=img.dtype, device=img.device).unsqueeze(0).unsqueeze(0)
+    sobel_kernel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=img.dtype, device=img.device).unsqueeze(0).unsqueeze(0)
+    
+    grad_x = func.conv2d(gray_img, sobel_kernel_x, padding=1)
+    grad_y = func.conv2d(gray_img, sobel_kernel_y, padding=1)
+    
+    grad_magnitude = torch.sqrt(grad_x ** 2 + grad_y ** 2)
+    return grad_magnitude

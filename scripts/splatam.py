@@ -32,7 +32,7 @@ from utils.slam_helpers import (
     transformed_params2rendervar, transformed_params2depthplussilhouette,
     transform_to_frame, l1_loss_v1, matrix_to_quaternion
 )
-from utils.slam_external import calc_ssim, build_rotation, prune_gaussians, densify
+from utils.slam_external import calc_ssim, build_rotation, prune_gaussians, densify, sobel_operator
 
 from diff_gaussian_rasterization import GaussianRasterizer as Renderer
 
@@ -278,7 +278,18 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
             losses['depth'] = torch.abs(curr_data['depth'] - depth)[mask].sum()
         else:
             losses['depth'] = torch.abs(curr_data['depth'] - depth)[mask].mean()
-    
+    # if mapping:
+    #     print(torch.sum(presence_sil_mask).float() / presence_sil_mask.numel())
+
+    use_edge_loss = False
+    if ((torch.sum(presence_sil_mask).float() / presence_sil_mask.numel()) < 0.9) and mapping == True:
+        use_edge_loss = True
+    # 计算边缘感知损失
+    if use_edge_loss:
+        output_edges = sobel_operator(im.unsqueeze(0))
+        target_edges = sobel_operator(curr_data['im'].unsqueeze(0))
+        losses['edge'] = F.mse_loss(output_edges, target_edges).mean()
+
     # RGB Loss
     if tracking and (use_sil_for_loss or ignore_outlier_depth_loss):
         color_mask = torch.tile(mask, (3, 1, 1))
@@ -287,7 +298,7 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     elif tracking:
         losses['im'] = torch.abs(curr_data['im'] - im).sum()
     else:
-        losses['im'] = 0.8 * l1_loss_v1(im, curr_data['im']) + 0.2 * (1.0 - calc_ssim(im, curr_data['im']))
+        losses['im'] = (0.8 * l1_loss_v1(im, curr_data['im']) + 0.2 * (1.0 - calc_ssim(im, curr_data['im'])))
 
     # Visualize the Diff Images
     if tracking and visualize_tracking_loss:
@@ -416,7 +427,10 @@ def add_new_gaussians(params, variables, curr_data, sil_thres,
         variables['max_2D_radius'] = torch.zeros(num_pts, device="cuda").float()
         new_timestep = time_idx*torch.ones(new_pt_cld.shape[0],device="cuda").float()
         variables['timestep'] = torch.cat((variables['timestep'],new_timestep),dim=0)
-
+        variables['seen'] = torch.cat((variables['seen'], torch.ones(new_pt_cld.shape[0], dtype=torch.bool, device="cuda")))
+    # print('add new gaussian!')
+    # print(f"Size of means2D_gradient_accum: {variables['means2D_gradient_accum'].size()}\n")
+    # print(f"Size of seen: {variables['seen'].size()}\n")
     return params, variables
 
 
@@ -475,7 +489,7 @@ def rgbd_slam(config: dict):
         wandb_tracking_step = 0
         wandb_mapping_step = 0
         wandb_run = wandb.init(project=config['wandb']['project'],
-                               entity=config['wandb']['entity'],
+                               # entity=config['wandb']['entity'],
                                group=config['wandb']['group'],
                                name=config['wandb']['name'],
                                config=config)
@@ -641,6 +655,7 @@ def rgbd_slam(config: dict):
     
     # Iterate over Scan
     for time_idx in tqdm(range(checkpoint_time_idx, num_frames)):
+        key_frame_flag = False
         # Load RGBD frames incrementally instead of all frames
         color, depth, _, gt_pose = dataset[time_idx]
         # Process poses
@@ -706,6 +721,7 @@ def rgbd_slam(config: dict):
                 with torch.no_grad():
                     # Save the best candidate rotation & translation
                     if loss < current_min_loss:
+                        key_frame_flag = True
                         current_min_loss = loss
                         candidate_cam_unnorm_rot = params['cam_unnorm_rots'][..., time_idx].detach().clone()
                         candidate_cam_tran = params['cam_trans'][..., time_idx].detach().clone()
@@ -806,6 +822,7 @@ def rgbd_slam(config: dict):
                 curr_w2c[:3, 3] = curr_cam_tran
                 # Select Keyframes for Mapping
                 num_keyframes = config['mapping_window_size']-2
+
                 selected_keyframes = keyframe_selection_overlap(depth, curr_w2c, intrinsics, keyframe_list[:-1], num_keyframes)
                 selected_time_idx = [keyframe_list[frame_idx]['id'] for frame_idx in selected_keyframes]
                 if len(keyframe_list) > 0:
@@ -846,7 +863,7 @@ def rgbd_slam(config: dict):
                 # Loss for current frame
                 loss, variables, losses = get_loss(params, iter_data, variables, iter_time_idx, config['mapping']['loss_weights'],
                                                 config['mapping']['use_sil_for_loss'], config['mapping']['sil_thres'],
-                                                config['mapping']['use_l1'], config['mapping']['ignore_outlier_depth_loss'], mapping=True)
+                                                config['mapping']['use_l1'], config['mapping']['ignore_outlier_depth_loss'], mapping=True,do_ba = key_frame_flag)
                 if config['use_wandb']:
                     # Report Loss
                     wandb_mapping_step = report_loss(losses, wandb_run, wandb_mapping_step, mapping=True)
@@ -867,6 +884,13 @@ def rgbd_slam(config: dict):
                                            "Mapping/step": wandb_mapping_step})
                     # Optimizer Update
                     optimizer.step()
+                    min_radius = 0.001  # 设定的最小半径阈值
+                    scale_factor = 2  # 放大因子
+
+                    if iter_time_idx % 100 == 0:  # 每 10 次迭代执行一次放大操作
+                        scales = torch.exp(params['log_scales'])
+                        small_scale_mask = scales < min_radius
+                        params['log_scales'][small_scale_mask] += torch.log(torch.tensor(scale_factor)).to(scales.device)
                     optimizer.zero_grad(set_to_none=True)
                     # Report Progress
                     if config['report_iter_progress']:
@@ -910,7 +934,8 @@ def rgbd_slam(config: dict):
         
         # Add frame to keyframe list
         if ((time_idx == 0) or ((time_idx+1) % config['keyframe_every'] == 0) or \
-                    (time_idx == num_frames-2)) and (not torch.isinf(curr_gt_w2c[-1]).any()) and (not torch.isnan(curr_gt_w2c[-1]).any()):
+                    (time_idx == num_frames-2)) and (not torch.isinf(curr_gt_w2c[-1]).any()) and (not torch.isnan(curr_gt_w2c[-1]).any()) or \
+                         key_frame_flag == True :
             with torch.no_grad():
                 # Get the current estimated rotation & translation
                 curr_cam_rot = F.normalize(params['cam_unnorm_rots'][..., time_idx].detach())
