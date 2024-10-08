@@ -588,9 +588,12 @@ def eval(dataset, final_params, num_frames, eval_dir, sil_thres, mapping_iters, 
     #     wandb_run.log({"Eval Metrics": fig})
     # plt.close()
 
-def select_high_frequency_regions(image, threshold_ratio=0.1):
+import torch
+import numpy as np
+
+def select_high_frequency_regions(image, threshold_ratio=1):
     """
-    通过傅里叶变换选取图像中的高频区域。
+    通过傅里叶变换选取图像中的高频区域，并返回每个像素是否属于高频区域。
     
     Args:
         image (torch.Tensor): 输入图像，形状为 (C, H, W) 或 (H, W)。
@@ -617,14 +620,26 @@ def select_high_frequency_regions(image, threshold_ratio=0.1):
     max_value = np.max(magnitude_spectrum)
     high_freq_threshold = threshold_ratio * max_value
 
-    # 创建高频掩码
+    # 创建高频掩码，标记出高频的频域位置
     high_freq_mask_np = magnitude_spectrum > high_freq_threshold
 
+    # 将高频掩码应用于频率域数据，保留高频部分
+    fft_shift_filtered = fft_shift * high_freq_mask_np
+
+    # 将频率域的高频部分逆傅里叶变换回空间域
+    filtered_fft_image = np.fft.ifftshift(fft_shift_filtered)  # 逆 shift
+    image_back = np.fft.ifft2(filtered_fft_image)  # 逆傅里叶变换
+    image_back = np.abs(image_back)  # 获取恢复图像的幅值
+
+    # 通过逆变换后的结果，确定哪些像素属于高频区域
+    pixel_max_value = np.max(image_back)
+    pixel_high_freq_threshold = threshold_ratio * pixel_max_value
+    high_freq_pixel_mask_np = image_back > pixel_high_freq_threshold  # 标记高频像素
+
     # 转换回 Torch 张量
-    high_freq_mask = torch.from_numpy(high_freq_mask_np).float().cuda()
+    high_freq_pixel_mask = torch.from_numpy(high_freq_pixel_mask_np).float().cuda()
 
-    return high_freq_mask
-
+    return high_freq_pixel_mask
 
 def map_high_frequency_to_gaussians(means2D, high_freq_mask):
     """

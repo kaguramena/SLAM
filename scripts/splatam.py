@@ -419,7 +419,7 @@ def add_new_gaussians(params, variables, curr_data, sil_thres,
         with torch.no_grad():
             means2D = compute_means2D(params['means3D'], curr_data['intrinsics'], curr_data['w2c'])
 
-            high_freq_mask = select_high_frequency_regions(gt_depth, threshold_ratio=0.95)
+            high_freq_mask = select_high_frequency_regions(gt_depth, threshold_ratio=1)
 
             # 映射高频区域到高斯点
             high_freq_gaussian_mask = map_high_frequency_to_gaussians(means2D, high_freq_mask)
