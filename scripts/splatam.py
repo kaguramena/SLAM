@@ -5,6 +5,8 @@ import sys
 import time
 from importlib.machinery import SourceFileLoader
 
+
+
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 sys.path.insert(0, _BASE_DIR)
@@ -32,9 +34,11 @@ from utils.slam_helpers import (
     transformed_params2rendervar, transformed_params2depthplussilhouette,
     transform_to_frame, l1_loss_v1, matrix_to_quaternion
 )
-from utils.slam_external import calc_ssim, build_rotation, prune_gaussians, densify, sobel_operator
+from utils.slam_external import calc_ssim, build_rotation, prune_gaussians, densify, laplacian_operator
 
 from diff_gaussian_rasterization import GaussianRasterizer as Renderer
+
+from utils.gs_helpers import compute_means2D, map_high_frequency_to_gaussians, select_high_frequency_regions
 
 
 def get_dataset(config_dict, basedir, sequence, **kwargs):
@@ -248,6 +252,7 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     rendervar['means2D'].retain_grad()
     im, radius, _, = Renderer(raster_settings=curr_data['cam'])(**rendervar)
     variables['means2D'] = rendervar['means2D']  # Gradient only accum from colour render for densification
+    variables['curr_radius'] = radius
 
     # Depth & Silhouette Rendering
     depth_sil, _, _, = Renderer(raster_settings=curr_data['cam'])(**depth_sil_rendervar)
@@ -257,6 +262,8 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     depth_sq = depth_sil[2, :, :].unsqueeze(0)
     uncertainty = depth_sq - depth**2
     uncertainty = uncertainty.detach()
+
+
 
     # Mask with valid depth values (accounts for outlier depth values)
     nan_mask = (~torch.isnan(depth)) & (~torch.isnan(uncertainty))
@@ -282,13 +289,14 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     #     print(torch.sum(presence_sil_mask).float() / presence_sil_mask.numel())
 
     use_edge_loss = False
-    if ((torch.sum(presence_sil_mask).float() / presence_sil_mask.numel()) < 0.9) and mapping == True:
+    if ((torch.sum(presence_sil_mask).float() / presence_sil_mask.numel()) < 0.90) and mapping == True:
         use_edge_loss = True
+        
     # 计算边缘感知损失
     if use_edge_loss:
-        output_edges = sobel_operator(im.unsqueeze(0))
-        target_edges = sobel_operator(curr_data['im'].unsqueeze(0))
-        losses['edge'] = F.mse_loss(output_edges, target_edges).mean()
+        output_edges = laplacian_operator(im.unsqueeze(0))
+        target_edges = laplacian_operator(curr_data['im'].unsqueeze(0))
+        losses['edge'] = F.mse_loss(output_edges, target_edges).sum()
 
     # RGB Loss
     if tracking and (use_sil_for_loss or ignore_outlier_depth_loss):
@@ -387,11 +395,13 @@ def initialize_new_params(new_pt_cld, mean3_sq_dist, gaussian_distribution):
 
 
 def add_new_gaussians(params, variables, curr_data, sil_thres, 
-                      time_idx, mean_sq_dist_method, gaussian_distribution):
+                      time_idx, mean_sq_dist_method, gaussian_distribution,add_frozen_gs = False):
     # Silhouette Rendering
     transformed_gaussians = transform_to_frame(params, time_idx, gaussians_grad=False, camera_grad=False)
     depth_sil_rendervar = transformed_params2depthplussilhouette(params, curr_data['w2c'],
                                                                  transformed_gaussians)
+    # depth_sil_rendervar['scales'] = torch.clamp(depth_sil_rendervar['scales'],max = depth_sil_rendervar['scales'].mean())
+
     depth_sil, _, _, = Renderer(raster_settings=curr_data['cam'])(**depth_sil_rendervar)
     silhouette = depth_sil[1, :, :]
     non_presence_sil_mask = (silhouette < sil_thres)
@@ -404,7 +414,38 @@ def add_new_gaussians(params, variables, curr_data, sil_thres,
     non_presence_mask = non_presence_sil_mask | non_presence_depth_mask
     # Flatten mask
     non_presence_mask = non_presence_mask.reshape(-1)
+    old_gs_num = params['means3D'].shape[0]
+    if add_frozen_gs:
+        with torch.no_grad():
+            means2D = compute_means2D(params['means3D'], curr_data['intrinsics'], curr_data['w2c'])
 
+            high_freq_mask = select_high_frequency_regions(gt_depth, threshold_ratio=0.95)
+
+            # 映射高频区域到高斯点
+            high_freq_gaussian_mask = map_high_frequency_to_gaussians(means2D, high_freq_mask)
+
+           # 对高频高斯进行复制，但只冻结 means3D
+            high_freq_params = {}
+            for k, v in params.items():
+                if v.shape[0] == params['means3D'].shape[0]:
+                    high_freq_params[k] = v[high_freq_gaussian_mask > 0]
+
+            # 对 means3D 进行冻结处理，但其他参数保持可学习状态
+            frozen_means3D = high_freq_params['means3D'].clone().detach()  # 冻结 means3D 副本
+            frozen_means3D_param = torch.nn.Parameter(frozen_means3D, requires_grad=False)
+
+            # 构造新的参数字典，其中 means3D 只冻结高频部分
+            params['means3D'] = torch.nn.Parameter(torch.cat((params['means3D'], frozen_means3D_param), dim=0), requires_grad=True)
+
+            # 对其他参数进行合并处理
+            for k, v in high_freq_params.items():
+                if k != 'means3D':
+                    new_v = torch.nn.Parameter(v.clone(), requires_grad=True)  # 保持可学习状态
+                    params[k] = torch.nn.Parameter(torch.cat((params[k], new_v), dim=0), requires_grad=True)
+
+
+
+    
     # Get the new frame Gaussians based on the Silhouette
     if torch.sum(non_presence_mask) > 0:
         # Get the new pointcloud in the world frame
@@ -425,7 +466,7 @@ def add_new_gaussians(params, variables, curr_data, sil_thres,
         variables['means2D_gradient_accum'] = torch.zeros(num_pts, device="cuda").float()
         variables['denom'] = torch.zeros(num_pts, device="cuda").float()
         variables['max_2D_radius'] = torch.zeros(num_pts, device="cuda").float()
-        new_timestep = time_idx*torch.ones(new_pt_cld.shape[0],device="cuda").float()
+        new_timestep = time_idx*torch.ones(num_pts - old_gs_num,device="cuda").float()
         variables['timestep'] = torch.cat((variables['timestep'],new_timestep),dim=0)
         variables['seen'] = torch.cat((variables['seen'], torch.ones(new_pt_cld.shape[0], dtype=torch.bool, device="cuda")))
     # print('add new gaussian!')
@@ -671,6 +712,8 @@ def rgbd_slam(config: dict):
         curr_data = {'cam': cam, 'im': color, 'depth': depth, 'id': iter_time_idx, 'intrinsics': intrinsics, 
                      'w2c': first_frame_w2c, 'iter_gt_w2c_list': curr_gt_w2c}
         
+
+        tracking_curr_data = {}
         # Initialize Data for Tracking
         if seperate_tracking_res:
             tracking_color, tracking_depth, _, _ = tracking_dataset[time_idx]
@@ -789,6 +832,9 @@ def rgbd_slam(config: dict):
                 save_params_ckpt(params, ckpt_output_dir, time_idx)
                 print('Failed to evaluate trajectory.')
 
+        
+
+
         # Densification & KeyFrame-based Mapping
         if time_idx == 0 or (time_idx+1) % config['map_every'] == 0:
             # Densification
@@ -803,11 +849,13 @@ def rgbd_slam(config: dict):
                                  'intrinsics': densify_intrinsics, 'w2c': first_frame_w2c, 'iter_gt_w2c_list': curr_gt_w2c}
                 else:
                     densify_curr_data = curr_data
-
+                add_frozen_gs = False
+                if (time_idx + 1) % 100 == 0:
+                    add_frozen_gs = True
                 # Add new Gaussians to the scene based on the Silhouette
                 params, variables = add_new_gaussians(params, variables, densify_curr_data, 
                                                       config['mapping']['sil_thres'], time_idx,
-                                                      config['mean_sq_dist_method'], config['gaussian_distribution'])
+                                                      config['mean_sq_dist_method'], config['gaussian_distribution'],add_frozen_gs=add_frozen_gs)
                 post_num_pts = params['means3D'].shape[0]
                 if config['use_wandb']:
                     wandb_run.log({"Mapping/Number of Gaussians": post_num_pts,
@@ -845,7 +893,10 @@ def rgbd_slam(config: dict):
             for iter in range(num_iters_mapping):
                 iter_start_time = time.time()
                 # Randomly select a frame until current time step amongst keyframes
-                rand_idx = np.random.randint(0, len(selected_keyframes))
+                if ((iter+1) %  num_iters_mapping) == 0:
+                    rand_idx = len(selected_keyframes) - 1  # i think its neccessary to often mapping the current frame
+                else:
+                    rand_idx = np.random.randint(0, len(selected_keyframes))
                 selected_rand_keyframe_idx = selected_keyframes[rand_idx]
                 if selected_rand_keyframe_idx == -1:
                     # Use Current Frame Data
@@ -869,6 +920,8 @@ def rgbd_slam(config: dict):
                     wandb_mapping_step = report_loss(losses, wandb_run, wandb_mapping_step, mapping=True)
                 # Backprop
                 loss.backward()
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
                 with torch.no_grad():
                     # Prune Gaussians
                     if config['mapping']['prune_gaussians']:
@@ -882,17 +935,22 @@ def rgbd_slam(config: dict):
                         if config['use_wandb']:
                             wandb_run.log({"Mapping/Number of Gaussians - Densification": params['means3D'].shape[0],
                                            "Mapping/step": wandb_mapping_step})
-                    # Optimizer Update
-                    optimizer.step()
-                    min_radius = 0.001  # 设定的最小半径阈值
-                    scale_factor = 2  # 放大因子
+                    
+                    if (time_idx + 1) % 20 == 0 :
+                        radius = variables['curr_radius']
+                        
+                        # I need to define what's the small gaussian,its critical
+                        # and I noticed that when the slam continue running,the quality is lower
 
-                    if iter_time_idx % 100 == 0:  # 每 10 次迭代执行一次放大操作
-                        scales = torch.exp(params['log_scales'])
-                        small_scale_mask = scales < min_radius
-                        params['log_scales'][small_scale_mask] += torch.log(torch.tensor(scale_factor)).to(scales.device)
-                    optimizer.zero_grad(set_to_none=True)
+                        small_scale_mask = (radius < 1) & (radius > 0.5)
+
+                        # Adjust the gaussian's scale through the param['log_scales']
+                        if small_scale_mask.any():
+                            # dynamic_scale_factor = max_2D[small_scale_mask]
+                            # 将调整后的尺度写回到 log_scales
+                            params['log_scales'][small_scale_mask] = torch.log(variables['max_2D_radius'][small_scale_mask])
                     # Report Progress
+                    optimizer.zero_grad(set_to_none=True)
                     if config['report_iter_progress']:
                         if config['use_wandb']:
                             report_progress(params, iter_data, iter+1, progress_bar, iter_time_idx, sil_thres=config['mapping']['sil_thres'], 

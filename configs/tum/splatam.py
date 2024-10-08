@@ -36,12 +36,12 @@ config = dict(
     checkpoint_time_idx=0,
     save_checkpoints=False, # Save Checkpoints
     checkpoint_interval=100, # Checkpoint Interval
-    use_wandb=True,
+    use_wandb = True,
     wandb=dict(
         # entity="theairlab",
         project="SplaTAM",
         group=group_name,
-        name="Add scale iter time",
+        name="Add dynamic scale adjust",
         save_qual=False,
         eval_save_qual=True,
     ),
@@ -70,7 +70,6 @@ config = dict(
         loss_weights=dict(
             im=0.5,
             depth=1.0,
-            edge=0.7
         ),
         lrs=dict(
             means3D=0.0,
@@ -95,7 +94,7 @@ config = dict(
         loss_weights=dict(
             im=0.7,
             depth=1.0,
-            edge=1.5  # maybe should continue update its weight
+            edge=2.0  # maybe should continue update its weight
         ),
         lrs=dict(
             means3D=0.0001,

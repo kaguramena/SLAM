@@ -17,6 +17,7 @@
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as func
 from torch.autograd import Variable
 from math import exp
@@ -295,20 +296,19 @@ def get_expon_lr_func(
     return helper
 
 
-def rgb_to_grayscale(img):
-    r, g, b = img[:, 0, :, :], img[:, 1, :, :], img[:, 2, :, :]
-    gray_img = 0.2989 * r + 0.5870 * g + 0.1140 * b
-    return gray_img.unsqueeze(1)  # Add channel dimension
+# 定义拉普拉斯算子卷积核
+laplacian_kernel = torch.tensor([[[[0, 1, 0], [1, -4, 1], [0, 1, 0]]]], dtype=torch.float32)
 
-def sobel_operator(img):
-    # Convert RGB to grayscale
-    gray_img = rgb_to_grayscale(img)
+# 定义拉普拉斯操作函数
+def laplacian_operator(image):
+    device = image.device  # 获取输入图像的设备（CPU或CUDA）
+    
+    laplacian_conv = nn.Conv2d(1, 1, kernel_size=3, padding=1, bias=False).to(device)
+    laplacian_kernel_device = laplacian_kernel.to(device)
+    laplacian_conv.weight = nn.Parameter(laplacian_kernel_device)
 
-    sobel_kernel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=img.dtype, device=img.device).unsqueeze(0).unsqueeze(0)
-    sobel_kernel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=img.dtype, device=img.device).unsqueeze(0).unsqueeze(0)
+    # 如果图像是 RGB (3 通道)，则将其转换为灰度图像
+    if image.shape[1] == 3:  # 检查通道数
+        image = torch.mean(image, dim=1, keepdim=True)  # 转换为灰度图像
     
-    grad_x = func.conv2d(gray_img, sobel_kernel_x, padding=1)
-    grad_y = func.conv2d(gray_img, sobel_kernel_y, padding=1)
-    
-    grad_magnitude = torch.sqrt(grad_x ** 2 + grad_y ** 2)
-    return grad_magnitude
+    return laplacian_conv(image)

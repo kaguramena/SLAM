@@ -587,3 +587,91 @@ def eval(dataset, final_params, num_frames, eval_dir, sil_thres, mapping_iters, 
     # if wandb_run is not None:
     #     wandb_run.log({"Eval Metrics": fig})
     # plt.close()
+
+def select_high_frequency_regions(image, threshold_ratio=0.1):
+    """
+    通过傅里叶变换选取图像中的高频区域。
+    
+    Args:
+        image (torch.Tensor): 输入图像，形状为 (C, H, W) 或 (H, W)。
+        threshold_ratio (float): 阈值比例，用于确定高频区域。
+        
+    Returns:
+        high_freq_mask (torch.Tensor): 高频区域掩码，形状与输入图像相同。
+    """
+    if image.dim() == 3:
+        # 使用单通道进行频域分析
+        image = torch.mean(image, dim=0)
+
+    # 将 Torch 张量转换为 NumPy 数组
+    image_np = image.cpu().numpy()
+
+    # 对图像进行 2D 傅里叶变换
+    fft_image = np.fft.fft2(image_np)
+    fft_shift = np.fft.fftshift(fft_image)
+
+    # 计算幅度谱
+    magnitude_spectrum = np.abs(fft_shift)
+
+    # 确定高频阈值
+    max_value = np.max(magnitude_spectrum)
+    high_freq_threshold = threshold_ratio * max_value
+
+    # 创建高频掩码
+    high_freq_mask_np = magnitude_spectrum > high_freq_threshold
+
+    # 转换回 Torch 张量
+    high_freq_mask = torch.from_numpy(high_freq_mask_np).float().cuda()
+
+    return high_freq_mask
+
+
+def map_high_frequency_to_gaussians(means2D, high_freq_mask):
+    """
+    将高频区域映射到对应的高斯点。
+    
+    Args:
+        params (dict): 包含当前高斯参数的字典。
+        high_freq_mask (torch.Tensor): 高频区域掩码，形状为 (H, W)。
+        intrinsics (torch.Tensor): 相机内参矩阵。
+        w2c (torch.Tensor): 世界坐标到相机坐标的变换矩阵。
+        
+    Returns:
+        high_freq_gaussian_mask (torch.Tensor): 标记属于高频区域的高斯点的布尔掩码。
+    """
+    height, width = high_freq_mask.shape
+
+    # 将 means2D 转换为图像坐标
+    means2D_int = torch.round(means2D).long()
+    means2D_int[:, 0] = torch.clamp(means2D_int[:, 0], 0, width - 1)
+    means2D_int[:, 1] = torch.clamp(means2D_int[:, 1], 0, height - 1)
+
+    # 获取对应于高斯点的高频掩码值
+    high_freq_gaussian_mask = high_freq_mask[means2D_int[:, 1], means2D_int[:, 0]]
+
+    return high_freq_gaussian_mask
+
+def compute_means2D(means3D, intrinsics, w2c):
+    """
+    将 3D 高斯点投影到 2D 图像平面上。
+    
+    Args:
+        means3D (torch.Tensor): 高斯点的三维坐标，形状为 (N, 3)。
+        intrinsics (torch.Tensor): 相机内参矩阵，形状为 (3, 3)。
+        w2c (torch.Tensor): 世界坐标到相机坐标的转换矩阵，形状为 (4, 4)。
+    
+    Returns:
+        means2D (torch.Tensor): 投影到图像平面的 2D 坐标，形状为 (N, 2)。
+    """
+    # 将 3D 点转换为相机坐标系下的点
+    means3D_h = torch.cat([means3D, torch.ones(means3D.shape[0], 1, device=means3D.device)], dim=1)  # (N, 4)
+    pts_cam = (w2c @ means3D_h.T).T[:, :3]  # (N, 3)
+
+    # 投影到图像平面
+    fx, fy = intrinsics[0, 0], intrinsics[1, 1]
+    cx, cy = intrinsics[0, 2], intrinsics[1, 2]
+    x = (pts_cam[:, 0] / pts_cam[:, 2]) * fx + cx
+    y = (pts_cam[:, 1] / pts_cam[:, 2]) * fy + cy
+
+    means2D = torch.stack([x, y], dim=1)  # (N, 2)
+    return means2D
