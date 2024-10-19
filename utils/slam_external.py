@@ -171,8 +171,73 @@ def remove_points(to_remove, params, variables, optimizer):
 def inverse_sigmoid(x):
     return torch.log(x / (1 - x))
 
+def build_pixel_to_gaussian_index_table(params, curr_data):
+    """
+    使用 Tensor 操作优化后的函数，通过统计每个像素上投影的高斯点，找到不透明度最大的高斯点索引。
 
-def prune_gaussians(params, variables, optimizer, iter, prune_dict):
+    参数：
+    - params: 包含高斯点参数的字典，包括 'means3D' 和 'logit_opacities'。
+    - curr_data: 当前帧的数据，包括 'intrinsics'、'w2c' 和图像尺寸信息。
+
+    返回：
+    - pixel_to_gaussian_indices: 大小为 [num_pixels] 的张量，其中每个元素是对应像素的不透明度最大的高斯点索引。
+      如果没有高斯点投影到该像素，则值为 -1。
+    """
+    import torch
+    import torch_scatter
+
+    device = params['means3D'].device
+    image_height, image_width = curr_data['im'].shape[1], curr_data['im'].shape[2]
+    num_pixels = image_width * image_height
+
+    # 将3D点转换到相机坐标系
+    means3D_hom = torch.cat([params['means3D'], torch.ones((params['means3D'].shape[0], 1), device=device)], dim=1)
+    means3D_cam = (curr_data['w2c'].to(device) @ means3D_hom.T).T[:, :3]
+
+    # 过滤掉相机后方的点
+    valid_mask = means3D_cam[:, 2] > 0
+    valid_gaussian_indices = torch.nonzero(valid_mask).squeeze()
+    means3D_cam = means3D_cam[valid_mask]
+
+    # 获取相机内参并进行投影
+    intrinsics = curr_data['intrinsics'].to(device)
+    u = intrinsics[0, 0] * (means3D_cam[:, 0] / means3D_cam[:, 2]) + intrinsics[0, 2]
+    v = intrinsics[1, 1] * (means3D_cam[:, 1] / means3D_cam[:, 2]) + intrinsics[1, 2]
+
+    # 转换到图像坐标并过滤无效像素
+    u_int, v_int = u.long(), v.long()
+    in_bounds_mask = (u_int >= 0) & (u_int < image_width) & (v_int >= 0) & (v_int < image_height)
+    valid_gaussian_indices = valid_gaussian_indices[in_bounds_mask]
+    u_int = u_int[in_bounds_mask]
+    v_int = v_int[in_bounds_mask]
+
+    # 计算像素的线性索引
+    pixel_indices = v_int * image_width + u_int
+
+    # 获取对应的高斯点不透明度
+    opacities = torch.sigmoid(params['logit_opacities']).squeeze()[valid_gaussian_indices]
+
+    # 初始化结果张量，默认值为 -1
+    pixel_to_gaussian_indices = -torch.ones(num_pixels, dtype=torch.long, device=device)
+
+    # 使用 scatter_max 来找到每个像素的不透明度最大的高斯点索引
+    try:
+        max_opacities, argmax_indices = torch_scatter.scatter_max(opacities, pixel_indices, dim=0, dim_size=num_pixels)
+
+        # 处理有效像素的索引
+        valid_pixels = max_opacities != float('-inf')
+        if valid_pixels.any():
+            clamped_indices = torch.clamp(argmax_indices[valid_pixels], min=0, max=valid_gaussian_indices.size(0) - 1)
+            pixel_to_gaussian_indices[valid_pixels] = valid_gaussian_indices[clamped_indices]
+    except Exception as e:
+        print("scatter_max operation failed:", e)
+        print("opacities:", opacities)
+        print("pixel_indices:", pixel_indices)
+        return pixel_to_gaussian_indices
+
+    return pixel_to_gaussian_indices
+
+def prune_gaussians(params, variables, optimizer, iter, prune_dict,curr_data):
     if iter <= prune_dict['stop_after']:
         if (iter >= prune_dict['start_after']) and (iter % prune_dict['prune_every'] == 0):
             if iter == prune_dict['stop_after']:
@@ -185,6 +250,28 @@ def prune_gaussians(params, variables, optimizer, iter, prune_dict):
             if iter >= prune_dict['remove_big_after']:
                 big_points_ws = torch.exp(params['log_scales']).max(dim=1).values > 0.1 * variables['scene_radius']
                 to_remove = torch.logical_or(to_remove, big_points_ws)
+
+            pixel_to_gs = build_pixel_to_gaussian_index_table(params,curr_data)
+            depth_sil = variables['depth_sil']
+            depth = depth_sil[0, :, :].unsqueeze(0)
+            silhouette = depth_sil[1, :, :]
+            depth_sq = depth_sil[2, :, :].unsqueeze(0)
+            depth_remove_mask = (silhouette > 0.99) & (abs(depth - curr_data['depth']) > 0.05)
+            depth_remove_mask = depth_remove_mask.reshape(-1)
+            gs_mask = pixel_to_gs[depth_remove_mask] # this will return a list that should be remove
+
+            valid_gaussian_indices = gs_mask[gs_mask >= 0]
+
+            # 确保索引是整数类型
+            valid_gaussian_indices = valid_gaussian_indices.long()
+
+            # 创建一个与 params['means3D'] 大小相同的布尔张量，初始化为 False
+            gaussian_mask = torch.zeros(params['means3D'].shape[0], dtype=torch.bool, device=gs_mask.device)
+
+            # 将有效索引对应的位置设置为 True
+            gaussian_mask[valid_gaussian_indices] = True
+
+            # 移除高斯点
             params, variables = remove_points(to_remove, params, variables, optimizer)
             torch.cuda.empty_cache()
         

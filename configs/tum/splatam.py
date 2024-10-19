@@ -41,7 +41,7 @@ config = dict(
         # entity="theairlab",
         project="SplaTAM",
         group=group_name,
-        name="Add dynamic scale adjust",
+        name="Add Depth-based Prune",
         save_qual=False,
         eval_save_qual=True,
     ),

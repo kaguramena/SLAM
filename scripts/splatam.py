@@ -262,6 +262,7 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     depth_sq = depth_sil[2, :, :].unsqueeze(0)
     uncertainty = depth_sq - depth**2
     uncertainty = uncertainty.detach()
+    variables['depth_sil'] = depth_sil
 
 
 
@@ -415,37 +416,34 @@ def add_new_gaussians(params, variables, curr_data, sil_thres,
     # Flatten mask
     non_presence_mask = non_presence_mask.reshape(-1)
     old_gs_num = params['means3D'].shape[0]
-    if add_frozen_gs:
-        with torch.no_grad():
-            means2D = compute_means2D(params['means3D'], curr_data['intrinsics'], curr_data['w2c'])
+    # if add_frozen_gs:
+    #     with torch.no_grad():
+    #         means2D = compute_means2D(params['means3D'], curr_data['intrinsics'], curr_data['w2c'])
 
-            high_freq_mask = select_high_frequency_regions(gt_depth, threshold_ratio=1)
+    #         high_freq_mask = select_high_frequency_regions(gt_depth, threshold_ratio=1)
 
-            # 映射高频区域到高斯点
-            high_freq_gaussian_mask = map_high_frequency_to_gaussians(means2D, high_freq_mask)
+    #         # 映射高频区域到高斯点
+    #         high_freq_gaussian_mask = map_high_frequency_to_gaussians(means2D, high_freq_mask)
 
-           # 对高频高斯进行复制，但只冻结 means3D
-            high_freq_params = {}
-            for k, v in params.items():
-                if v.shape[0] == params['means3D'].shape[0]:
-                    high_freq_params[k] = v[high_freq_gaussian_mask > 0]
+    #        # 对高频高斯进行复制，但只冻结 means3D
+    #         high_freq_params = {}
+    #         for k, v in params.items():
+    #             if v.shape[0] == params['means3D'].shape[0]:
+    #                 high_freq_params[k] = v[high_freq_gaussian_mask > 0]
 
-            # 对 means3D 进行冻结处理，但其他参数保持可学习状态
-            frozen_means3D = high_freq_params['means3D'].clone().detach()  # 冻结 means3D 副本
-            frozen_means3D_param = torch.nn.Parameter(frozen_means3D, requires_grad=False)
+    #         # 对 means3D 进行冻结处理，但其他参数保持可学习状态
+    #         frozen_means3D = high_freq_params['means3D'].clone().detach()  # 冻结 means3D 副本
+    #         frozen_means3D_param = torch.nn.Parameter(frozen_means3D, requires_grad=False)
 
-            # 构造新的参数字典，其中 means3D 只冻结高频部分
-            params['means3D'] = torch.nn.Parameter(torch.cat((params['means3D'], frozen_means3D_param), dim=0), requires_grad=True)
+    #         # 构造新的参数字典，其中 means3D 只冻结高频部分
+    #         params['means3D'] = torch.nn.Parameter(torch.cat((params['means3D'], frozen_means3D_param), dim=0), requires_grad=True)
 
-            # 对其他参数进行合并处理
-            for k, v in high_freq_params.items():
-                if k != 'means3D':
-                    new_v = torch.nn.Parameter(v.clone(), requires_grad=True)  # 保持可学习状态
-                    params[k] = torch.nn.Parameter(torch.cat((params[k], new_v), dim=0), requires_grad=True)
+    #         # 对其他参数进行合并处理
+    #         for k, v in high_freq_params.items():
+    #             if k != 'means3D':
+    #                 new_v = torch.nn.Parameter(v.clone(), requires_grad=True)  # 保持可学习状态
+    #                 params[k] = torch.nn.Parameter(torch.cat((params[k], new_v), dim=0), requires_grad=True)
 
-
-
-    
     # Get the new frame Gaussians based on the Silhouette
     if torch.sum(non_presence_mask) > 0:
         # Get the new pointcloud in the world frame
@@ -925,7 +923,7 @@ def rgbd_slam(config: dict):
                 with torch.no_grad():
                     # Prune Gaussians
                     if config['mapping']['prune_gaussians']:
-                        params, variables = prune_gaussians(params, variables, optimizer, iter, config['mapping']['pruning_dict'])
+                        params, variables = prune_gaussians(params, variables, optimizer, iter, config['mapping']['pruning_dict'],curr_data)
                         if config['use_wandb']:
                             wandb_run.log({"Mapping/Number of Gaussians - Pruning": params['means3D'].shape[0],
                                            "Mapping/step": wandb_mapping_step})
