@@ -132,6 +132,18 @@ def initialize_params(init_pt_cld, num_frames, mean3_sq_dist, gaussian_distribut
         log_scales = torch.tile(torch.log(torch.sqrt(mean3_sq_dist))[..., None], (1, 3))
     else:
         raise ValueError(f"Unknown gaussian_distribution {gaussian_distribution}")
+    
+    # 随机选择 20 % 个点作为特殊点
+    # select_num = int(num_pts * 0.2)
+    # special_indices = np.random.choice(num_pts,select_num, replace=False)
+    # max_logscale = torch.tensor([torch.max(log_scales) * (240. * 320. * 9. * torch.pi)])
+    # # 对特殊点进行透明度和半径的调整
+    # logit_opacities[special_indices] = torch.min(logit_opacities) * 0.05  # 设定为一个较小的值，使透明度接近 0
+    # if gaussian_distribution == "isotropic":
+    #     log_scales[special_indices] = max_logscale.cuda()  # 设定为一个较大的半径值
+    # elif gaussian_distribution == "anisotropic":
+    #     log_scales[special_indices] = torch.tensor([max_logscale,max_logscale,max_logscale]).cuda()  # 各个方向设为较大值
+
     params = {
         'means3D': means3D,
         'rgb_colors': init_pt_cld[:, 3:6],
@@ -245,6 +257,7 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
 
     # Initialize Render Variables
     rendervar = transformed_params2rendervar(params, transformed_gaussians)
+    variables['camera_means3D'] = transformed_gaussians['means3D']
     depth_sil_rendervar = transformed_params2depthplussilhouette(params, curr_data['w2c'],
                                                                  transformed_gaussians)
 
@@ -394,14 +407,16 @@ def initialize_new_params(new_pt_cld, mean3_sq_dist, gaussian_distribution):
 
     return params
 
+import random
 
 def add_new_gaussians(params, variables, curr_data, sil_thres, 
                       time_idx, mean_sq_dist_method, gaussian_distribution,add_frozen_gs = False):
     # Silhouette Rendering
     transformed_gaussians = transform_to_frame(params, time_idx, gaussians_grad=False, camera_grad=False)
+    
     depth_sil_rendervar = transformed_params2depthplussilhouette(params, curr_data['w2c'],
                                                                  transformed_gaussians)
-    # depth_sil_rendervar['scales'] = torch.clamp(depth_sil_rendervar['scales'],max = depth_sil_rendervar['scales'].mean())
+    depth_sil_rendervar['scales'] = torch.clamp(depth_sil_rendervar['scales'],max = depth_sil_rendervar['scales'].mean())
 
     depth_sil, _, _, = Renderer(raster_settings=curr_data['cam'])(**depth_sil_rendervar)
     silhouette = depth_sil[1, :, :]
@@ -414,35 +429,11 @@ def add_new_gaussians(params, variables, curr_data, sil_thres,
     # Determine non-presence mask
     non_presence_mask = non_presence_sil_mask | non_presence_depth_mask
     # Flatten mask
+
     non_presence_mask = non_presence_mask.reshape(-1)
     old_gs_num = params['means3D'].shape[0]
-    # if add_frozen_gs:
-    #     with torch.no_grad():
-    #         means2D = compute_means2D(params['means3D'], curr_data['intrinsics'], curr_data['w2c'])
+    
 
-    #         high_freq_mask = select_high_frequency_regions(gt_depth, threshold_ratio=1)
-
-    #         # 映射高频区域到高斯点
-    #         high_freq_gaussian_mask = map_high_frequency_to_gaussians(means2D, high_freq_mask)
-
-    #        # 对高频高斯进行复制，但只冻结 means3D
-    #         high_freq_params = {}
-    #         for k, v in params.items():
-    #             if v.shape[0] == params['means3D'].shape[0]:
-    #                 high_freq_params[k] = v[high_freq_gaussian_mask > 0]
-
-    #         # 对 means3D 进行冻结处理，但其他参数保持可学习状态
-    #         frozen_means3D = high_freq_params['means3D'].clone().detach()  # 冻结 means3D 副本
-    #         frozen_means3D_param = torch.nn.Parameter(frozen_means3D, requires_grad=False)
-
-    #         # 构造新的参数字典，其中 means3D 只冻结高频部分
-    #         params['means3D'] = torch.nn.Parameter(torch.cat((params['means3D'], frozen_means3D_param), dim=0), requires_grad=True)
-
-    #         # 对其他参数进行合并处理
-    #         for k, v in high_freq_params.items():
-    #             if k != 'means3D':
-    #                 new_v = torch.nn.Parameter(v.clone(), requires_grad=True)  # 保持可学习状态
-    #                 params[k] = torch.nn.Parameter(torch.cat((params[k], new_v), dim=0), requires_grad=True)
 
     # Get the new frame Gaussians based on the Silhouette
     if torch.sum(non_presence_mask) > 0:
@@ -922,7 +913,7 @@ def rgbd_slam(config: dict):
                 optimizer.zero_grad(set_to_none=True)
                 with torch.no_grad():
                     # Prune Gaussians
-                    if config['mapping']['prune_gaussians']:
+                    if config['mapping']['prune_gaussians'] and time_idx > 0:
                         params, variables = prune_gaussians(params, variables, optimizer, iter, config['mapping']['pruning_dict'],curr_data)
                         if config['use_wandb']:
                             wandb_run.log({"Mapping/Number of Gaussians - Pruning": params['means3D'].shape[0],
@@ -934,19 +925,25 @@ def rgbd_slam(config: dict):
                             wandb_run.log({"Mapping/Number of Gaussians - Densification": params['means3D'].shape[0],
                                            "Mapping/step": wandb_mapping_step})
                     
-                    if (time_idx + 1) % 20 == 0 :
-                        radius = variables['curr_radius']
-                        
-                        # I need to define what's the small gaussian,its critical
-                        # and I noticed that when the slam continue running,the quality is lower
-
-                        small_scale_mask = (radius < 1) & (radius > 0.5)
-
-                        # Adjust the gaussian's scale through the param['log_scales']
-                        if small_scale_mask.any():
-                            # dynamic_scale_factor = max_2D[small_scale_mask]
-                            # 将调整后的尺度写回到 log_scales
-                            params['log_scales'][small_scale_mask] = torch.log(variables['max_2D_radius'][small_scale_mask])
+                    if (time_idx + 1) % 30 == 0 :
+                                    
+                        with torch.no_grad():
+                            gt_color = curr_data['im']
+                            means2D = compute_means2D(params['means3D'], curr_data['intrinsics'], curr_data['w2c'])
+                            high_freq_mask = select_high_frequency_regions(gt_color, threshold_ratio=1)
+                            # 映射高频区域到高斯点
+                            high_freq_gaussian_mask = map_high_frequency_to_gaussians(means2D, high_freq_mask)
+                            radius = variables['curr_radius']
+                            # I need to define what's the small gaussian,its critical
+                            # and I noticed that when the slam continue running,the quality is lower
+                            small_scale_mask = (radius < radius.float().mean() * 0.1)
+                            if small_scale_mask.shape[0] == high_freq_gaussian_mask.shape[0]:
+                                small_scale_mask = small_scale_mask & high_freq_gaussian_mask.bool()
+                                # Adjust the gaussian's scale through the param['log_scales']
+                                if small_scale_mask.any():
+                                    # dynamic_scale_factor = max_2D[small_scale_mask]
+                                    # 将调整后的尺度写回到 log_scales
+                                    params['log_scales'][small_scale_mask] = torch.log(variables['max_2D_radius'][small_scale_mask])
                     # Report Progress
                     optimizer.zero_grad(set_to_none=True)
                     if config['report_iter_progress']:
