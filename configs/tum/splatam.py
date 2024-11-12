@@ -94,7 +94,8 @@ config = dict(
         loss_weights=dict(
             im=0.7,
             depth=1.0,
-            edge=2.0  # maybe should continue update its weight
+            edge=2.0,  # maybe should continue update its weight
+            scales=0.01
         ),
         lrs=dict(
             means3D=0.0001,
@@ -114,7 +115,7 @@ config = dict(
             removal_opacity_threshold=0.005,
             final_removal_opacity_threshold=0.005,
             reset_opacities=False,
-            reset_opacities_every=500, # Doesn't consider iter 0
+            reset_opacities_every=3000, # Doesn't consider iter 0
         ),
         use_gaussian_splatting_densification=False, # Use Gaussian Splatting-based Densification during Mapping
         densify_dict=dict( # Needs to be updated based on the number of mapping iterations
@@ -130,10 +131,10 @@ config = dict(
         ),
     ),
     viz=dict(
-        render_mode='color', # ['color', 'depth' or 'centers']
+        render_mode='centers', # ['color', 'depth' or 'centers']
         offset_first_viz_cam=True, # Offsets the view camera back by 0.5 units along the view direction (For Final Recon Viz)
         show_sil=False, # Show Silhouette instead of RGB
-        visualize_cams=True, # Visualize Camera Frustums and Trajectory
+        visualize_cams=False, # Visualize Camera Frustums and Trajectory
         viz_w=600, viz_h=340,
         viz_near=0.01, viz_far=100.0,
         view_scale=2,

@@ -133,16 +133,7 @@ def initialize_params(init_pt_cld, num_frames, mean3_sq_dist, gaussian_distribut
     else:
         raise ValueError(f"Unknown gaussian_distribution {gaussian_distribution}")
     
-    # 随机选择 20 % 个点作为特殊点
-    # select_num = int(num_pts * 0.2)
-    # special_indices = np.random.choice(num_pts,select_num, replace=False)
-    # max_logscale = torch.tensor([torch.max(log_scales) * (240. * 320. * 9. * torch.pi)])
-    # # 对特殊点进行透明度和半径的调整
-    # logit_opacities[special_indices] = torch.min(logit_opacities) * 0.05  # 设定为一个较小的值，使透明度接近 0
-    # if gaussian_distribution == "isotropic":
-    #     log_scales[special_indices] = max_logscale.cuda()  # 设定为一个较大的半径值
-    # elif gaussian_distribution == "anisotropic":
-    #     log_scales[special_indices] = torch.tensor([max_logscale,max_logscale,max_logscale]).cuda()  # 各个方向设为较大值
+    
 
     params = {
         'means3D': means3D,
@@ -254,7 +245,6 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
         transformed_gaussians = transform_to_frame(params, iter_time_idx,
                                              gaussians_grad=True,
                                              camera_grad=False)
-
     # Initialize Render Variables
     rendervar = transformed_params2rendervar(params, transformed_gaussians)
     variables['camera_means3D'] = transformed_gaussians['means3D']
@@ -322,6 +312,11 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     else:
         losses['im'] = (0.8 * l1_loss_v1(im, curr_data['im']) + 0.2 * (1.0 - calc_ssim(im, curr_data['im'])))
 
+    # Regularization
+    if mapping and use_edge_loss:
+        losses['scales'] = torch.abs(radius - radius.min()).float().mean() # I hope this can work
+
+
     # Visualize the Diff Images
     if tracking and visualize_tracking_loss:
         fig, ax = plt.subplots(2, 4, figsize=(12, 6))
@@ -385,12 +380,35 @@ def initialize_new_params(new_pt_cld, mean3_sq_dist, gaussian_distribution):
     means3D = new_pt_cld[:, :3] # [num_gaussians, 3]
     unnorm_rots = np.tile([1, 0, 0, 0], (num_pts, 1)) # [num_gaussians, 4]
     logit_opacities = torch.zeros((num_pts, 1), dtype=torch.float, device="cuda")
+
+    
+
     if gaussian_distribution == "isotropic":
         log_scales = torch.tile(torch.log(torch.sqrt(mean3_sq_dist))[..., None], (1, 1))
     elif gaussian_distribution == "anisotropic":
         log_scales = torch.tile(torch.log(torch.sqrt(mean3_sq_dist))[..., None], (1, 3))
     else:
         raise ValueError(f"Unknown gaussian_distribution {gaussian_distribution}")
+    
+    # 随机选择 10 % 个点作为特殊点
+    select_num = int(num_pts * 0.1)
+    np.random.seed(42)  # 设置随机种子
+    special_indices = np.random.choice(num_pts,select_num, replace=False)
+    if log_scales.numel() == 0:
+        max_logscale = torch.tensor([0.0])  # or another appropriate default value
+    else:
+        max_logscale = torch.tensor([torch.max(log_scales) * (240. * 320. * 9. * torch.pi)])
+    # 对特殊点进行透明度和半径的调整
+    if logit_opacities.numel() == 0:
+        default_value = torch.tensor(0.)  # 设定一个合适的默认值
+        logit_opacities[special_indices] = default_value
+    else:
+        logit_opacities[special_indices] = torch.min(logit_opacities) * 0.5
+    if gaussian_distribution == "isotropic":
+        log_scales[special_indices] = max_logscale.cuda()  # 设定为一个较大的半径值
+    elif gaussian_distribution == "anisotropic":
+        log_scales[special_indices] = torch.tensor([max_logscale,max_logscale,max_logscale]).cuda()  # 各个方向设为较大值
+
     params = {
         'means3D': means3D,
         'rgb_colors': new_pt_cld[:, 3:6],
@@ -398,6 +416,9 @@ def initialize_new_params(new_pt_cld, mean3_sq_dist, gaussian_distribution):
         'logit_opacities': logit_opacities,
         'log_scales': log_scales,
     }
+
+
+
     for k, v in params.items():
         # Check if value is already a torch tensor
         if not isinstance(v, torch.Tensor):
@@ -413,7 +434,17 @@ def add_new_gaussians(params, variables, curr_data, sil_thres,
                       time_idx, mean_sq_dist_method, gaussian_distribution,add_frozen_gs = False):
     # Silhouette Rendering
     transformed_gaussians = transform_to_frame(params, time_idx, gaussians_grad=False, camera_grad=False)
-    
+    # I need to choose a strategy of how to spilit color (Now is RGB) 
+
+    rendervar = transformed_params2rendervar(params, transformed_gaussians)
+    im, radius, _, = Renderer(raster_settings=curr_data['cam'])(**rendervar)
+    gt_im = curr_data['im']
+    # get three diff 
+    r_diff = (abs(im[0,:,:] - gt_im[0,:,:]))
+    g_diff = (abs(im[1,:,:] - gt_im[1,:,:]))
+    b_diff = (abs(im[2,:,:] - gt_im[2,:,:]))
+    color_mask = (r_diff > r_diff.mean()) & (g_diff > g_diff.mean()) & (b_diff > b_diff.mean())
+
     depth_sil_rendervar = transformed_params2depthplussilhouette(params, curr_data['w2c'],
                                                                  transformed_gaussians)
     depth_sil_rendervar['scales'] = torch.clamp(depth_sil_rendervar['scales'],max = depth_sil_rendervar['scales'].mean())
@@ -426,9 +457,11 @@ def add_new_gaussians(params, variables, curr_data, sil_thres,
     render_depth = depth_sil[0, :, :]
     depth_error = torch.abs(gt_depth - render_depth) * (gt_depth > 0)
     non_presence_depth_mask = (render_depth > gt_depth) * (depth_error > 50*depth_error.median())
+    color_mask = color_mask * non_presence_sil_mask
     # Determine non-presence mask
     non_presence_mask = non_presence_sil_mask | non_presence_depth_mask
-    # Flatten mask
+    # And here add a color-based mask
+    non_presence_mask = non_presence_mask | color_mask
 
     non_presence_mask = non_presence_mask.reshape(-1)
     old_gs_num = params['means3D'].shape[0]
@@ -839,8 +872,6 @@ def rgbd_slam(config: dict):
                 else:
                     densify_curr_data = curr_data
                 add_frozen_gs = False
-                if (time_idx + 1) % 100 == 0:
-                    add_frozen_gs = True
                 # Add new Gaussians to the scene based on the Silhouette
                 params, variables = add_new_gaussians(params, variables, densify_curr_data, 
                                                       config['mapping']['sil_thres'], time_idx,
@@ -925,27 +956,9 @@ def rgbd_slam(config: dict):
                             wandb_run.log({"Mapping/Number of Gaussians - Densification": params['means3D'].shape[0],
                                            "Mapping/step": wandb_mapping_step})
                     
-                    if (time_idx + 1) % 30 == 0 :
-                                    
-                        with torch.no_grad():
-                            gt_color = curr_data['im']
-                            means2D = compute_means2D(params['means3D'], curr_data['intrinsics'], curr_data['w2c'])
-                            high_freq_mask = select_high_frequency_regions(gt_color, threshold_ratio=1)
-                            # 映射高频区域到高斯点
-                            high_freq_gaussian_mask = map_high_frequency_to_gaussians(means2D, high_freq_mask)
-                            radius = variables['curr_radius']
-                            # I need to define what's the small gaussian,its critical
-                            # and I noticed that when the slam continue running,the quality is lower
-                            small_scale_mask = (radius < radius.float().mean() * 0.1)
-                            if small_scale_mask.shape[0] == high_freq_gaussian_mask.shape[0]:
-                                small_scale_mask = small_scale_mask & high_freq_gaussian_mask.bool()
-                                # Adjust the gaussian's scale through the param['log_scales']
-                                if small_scale_mask.any():
-                                    # dynamic_scale_factor = max_2D[small_scale_mask]
-                                    # 将调整后的尺度写回到 log_scales
-                                    params['log_scales'][small_scale_mask] = torch.log(variables['max_2D_radius'][small_scale_mask])
+                    
+
                     # Report Progress
-                    optimizer.zero_grad(set_to_none=True)
                     if config['report_iter_progress']:
                         if config['use_wandb']:
                             report_progress(params, iter_data, iter+1, progress_bar, iter_time_idx, sil_thres=config['mapping']['sil_thres'], 

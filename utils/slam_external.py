@@ -229,8 +229,9 @@ def prune_gaussians(params, variables, optimizer, iter, prune_dict,curr_data):
             depth_sil = variables['depth_sil']
             depth = depth_sil[0, :, :].unsqueeze(0)
             silhouette = depth_sil[1, :, :]
-            depth_sq = depth_sil[2, :, :].unsqueeze(0)
-            depth_remove_mask = (silhouette > 0.99) & (abs(depth - curr_data['depth']) > 0.001) # To pixel
+            depth_error = abs(depth - curr_data['depth'])
+            depth_remove_mask = torch.zeros_like(depth,dtype=torch.bool)
+            depth_remove_mask = (silhouette > 0.99) & (abs(depth - curr_data['depth']) > ((depth_error.max() - 0.01)))# To pixel
             depth_remove_mask = depth_remove_mask.reshape(-1) # To pixel
             
             # and now should pick gs from pixel
@@ -247,10 +248,10 @@ def prune_gaussians(params, variables, optimizer, iter, prune_dict,curr_data):
             # num_gs = params['means3D'].shape[0]
             # print(f'max_gs : {gaussian_mask.max()} ,min_gs :{gaussian_mask.min()}, num : {num_gs}, is_nan : {torch.isnan(depth_to_remove).any()}')
 
-            print(to_remove.sum())
-            # 将有效索引对应的位置设置为 True
-            # to_remove = torch.logical_or(to_remove,depth_to_remove)
             
+            # 将有效索引对应的位置设置为 True
+            to_remove = torch.logical_or(to_remove,depth_to_remove)
+            # print(depth_to_remove.sum(),to_remove.sum())
             # 移除高斯点
             params, variables = remove_points(to_remove, params, variables, optimizer)
             torch.cuda.empty_cache()
