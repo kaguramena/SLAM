@@ -76,6 +76,7 @@ config = dict(
             rgb_colors=0.0,
             unnorm_rotations=0.0,
             logit_opacities=0.0,
+            logit_rgb_opacities = 0.0,
             log_scales=0.0,
             cam_unnorm_rots=0.002,
             cam_trans=0.002,
@@ -102,6 +103,7 @@ config = dict(
             rgb_colors=0.0025,
             unnorm_rotations=0.001,
             logit_opacities=0.05,
+            logit_rgb_opacities = 0.05,
             log_scales=0.001,
             cam_unnorm_rots=0.0000,
             cam_trans=0.0000,
@@ -131,7 +133,7 @@ config = dict(
         ),
     ),
     viz=dict(
-        render_mode='centers', # ['color', 'depth' or 'centers']
+        render_mode='color', # ['color', 'depth' or 'centers']
         offset_first_viz_cam=True, # Offsets the view camera back by 0.5 units along the view direction (For Final Recon Viz)
         show_sil=False, # Show Silhouette instead of RGB
         visualize_cams=False, # Visualize Camera Frustums and Trajectory

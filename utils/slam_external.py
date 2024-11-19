@@ -380,3 +380,45 @@ def laplacian_operator(image):
         image = torch.mean(image, dim=1, keepdim=True)  # 转换为灰度图像
     
     return laplacian_conv(image)
+
+
+import torch
+import numpy as np
+import torch.nn.functional as F
+
+def optical_flow_loss(img1: torch.Tensor, img2: torch.Tensor) -> torch.Tensor:
+    """
+    计算两张图像之间的光流损失，损失为 sqrt(u^2 + v^2)，
+    其中 u 和 v 是光流在水平和垂直方向上的分量。
+
+    参数:
+    - img1 (torch.Tensor): 第一张图像，形状为 (C, H, W)。
+    - img2 (torch.Tensor): 第二张图像，形状为 (C, H, W)。
+
+    返回:
+    - torch.Tensor: 计算得到的光流损失。
+    """
+    # 如果图像是 RGB (3 通道)，则将其转换为灰度图像
+    if img1.shape[0] == 3:  # RGB -> 灰度
+        img1 = img1.mean(dim=0, keepdim=True)
+        img2 = img2.mean(dim=0, keepdim=True)
+
+    # 计算图像的梯度（使用Sobel算子）
+    sobel_kernel_x = torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]], dtype=torch.float32).to(img1.device)
+    sobel_kernel_y = torch.tensor([[[[-1, -2, -1], [0, 0, 0], [1, 2, 1]]]], dtype=torch.float32).to(img1.device)
+
+    img1_dx = F.conv2d(img1.unsqueeze(0), weight=sobel_kernel_x, padding=1)
+    img1_dy = F.conv2d(img1.unsqueeze(0), weight=sobel_kernel_y, padding=1)
+    img2_dx = F.conv2d(img2.unsqueeze(0), weight=sobel_kernel_x, padding=1)
+    img2_dy = F.conv2d(img2.unsqueeze(0), weight=sobel_kernel_y, padding=1)
+
+    # 计算光流的水平和垂直分量
+    u = img2_dx - img1_dx
+    v = img2_dy - img1_dy
+
+    # 计算光流损失
+    flow_loss = torch.sqrt(u**2 + v**2).mean()  # 计算每个像素点的光流模长，并取平均
+
+    return flow_loss
+
+

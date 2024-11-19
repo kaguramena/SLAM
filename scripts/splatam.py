@@ -126,6 +126,7 @@ def initialize_params(init_pt_cld, num_frames, mean3_sq_dist, gaussian_distribut
     means3D = init_pt_cld[:, :3] # [num_gaussians, 3]
     unnorm_rots = np.tile([1, 0, 0, 0], (num_pts, 1)) # [num_gaussians, 4]
     logit_opacities = torch.zeros((num_pts, 1), dtype=torch.float, device="cuda")
+    logit_rgb_opacities = torch.zeros((num_pts, 1), dtype=torch.float, device="cuda")
     if gaussian_distribution == "isotropic":
         log_scales = torch.tile(torch.log(torch.sqrt(mean3_sq_dist))[..., None], (1, 1))
     elif gaussian_distribution == "anisotropic":
@@ -133,13 +134,24 @@ def initialize_params(init_pt_cld, num_frames, mean3_sq_dist, gaussian_distribut
     else:
         raise ValueError(f"Unknown gaussian_distribution {gaussian_distribution}")
     
-    
+       # 随机选择 20 % 个点作为特殊点
+    np.random.seed(42)
+    select_num = int(num_pts * 0.2)
+    special_indices = np.random.choice(num_pts,select_num, replace=False)
+    max_logscale = torch.tensor([torch.max(log_scales) * (240. * 320. * 9. * torch.pi)])
+    # 对特殊点进行透明度和半径的调整
+    logit_opacities[special_indices] = torch.min(logit_opacities) * 0.05  # 设定为一个较小的值，使透明度接近 0
+    if gaussian_distribution == "isotropic":
+        log_scales[special_indices] = max_logscale.cuda()  # 设定为一个较大的半径值
+    elif gaussian_distribution == "anisotropic":
+        log_scales[special_indices] = torch.tensor([max_logscale,max_logscale,max_logscale]).cuda()  # 各个方向设为较大值
 
     params = {
         'means3D': means3D,
         'rgb_colors': init_pt_cld[:, 3:6],
         'unnorm_rotations': unnorm_rots,
         'logit_opacities': logit_opacities,
+        'logit_rgb_opacities' : logit_rgb_opacities,
         'log_scales': log_scales,
     }
 
@@ -292,8 +304,9 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     # if mapping:
     #     print(torch.sum(presence_sil_mask).float() / presence_sil_mask.numel())
 
+    cover_percent = (torch.sum(presence_sil_mask).float() / presence_sil_mask.numel())
     use_edge_loss = False
-    if ((torch.sum(presence_sil_mask).float() / presence_sil_mask.numel()) < 0.90) and mapping == True:
+    if (cover_percent > 0.95) and mapping == True:
         use_edge_loss = True
         
     # 计算边缘感知损失
@@ -313,7 +326,7 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
         losses['im'] = (0.8 * l1_loss_v1(im, curr_data['im']) + 0.2 * (1.0 - calc_ssim(im, curr_data['im'])))
 
     # Regularization
-    if mapping and use_edge_loss:
+    if mapping and cover_percent > 0.85:
         losses['scales'] = torch.abs(radius - radius.min()).float().mean() # I hope this can work
 
 
@@ -390,30 +403,13 @@ def initialize_new_params(new_pt_cld, mean3_sq_dist, gaussian_distribution):
     else:
         raise ValueError(f"Unknown gaussian_distribution {gaussian_distribution}")
     
-    # 随机选择 10 % 个点作为特殊点
-    select_num = int(num_pts * 0.1)
-    np.random.seed(42)  # 设置随机种子
-    special_indices = np.random.choice(num_pts,select_num, replace=False)
-    if log_scales.numel() == 0:
-        max_logscale = torch.tensor([0.0])  # or another appropriate default value
-    else:
-        max_logscale = torch.tensor([torch.max(log_scales) * (240. * 320. * 9. * torch.pi)])
-    # 对特殊点进行透明度和半径的调整
-    if logit_opacities.numel() == 0:
-        default_value = torch.tensor(0.)  # 设定一个合适的默认值
-        logit_opacities[special_indices] = default_value
-    else:
-        logit_opacities[special_indices] = torch.min(logit_opacities) * 0.5
-    if gaussian_distribution == "isotropic":
-        log_scales[special_indices] = max_logscale.cuda()  # 设定为一个较大的半径值
-    elif gaussian_distribution == "anisotropic":
-        log_scales[special_indices] = torch.tensor([max_logscale,max_logscale,max_logscale]).cuda()  # 各个方向设为较大值
 
     params = {
         'means3D': means3D,
         'rgb_colors': new_pt_cld[:, 3:6],
         'unnorm_rotations': unnorm_rots,
         'logit_opacities': logit_opacities,
+        'logit_rgb_opacities' : logit_opacities,
         'log_scales': log_scales,
     }
 
@@ -440,14 +436,14 @@ def add_new_gaussians(params, variables, curr_data, sil_thres,
     im, radius, _, = Renderer(raster_settings=curr_data['cam'])(**rendervar)
     gt_im = curr_data['im']
     # get three diff 
-    r_diff = (abs(im[0,:,:] - gt_im[0,:,:]))
-    g_diff = (abs(im[1,:,:] - gt_im[1,:,:]))
-    b_diff = (abs(im[2,:,:] - gt_im[2,:,:]))
-    color_mask = (r_diff > r_diff.mean()) & (g_diff > g_diff.mean()) & (b_diff > b_diff.mean())
+    r_diff = ((im[0,:,:] - gt_im[0,:,:])).bool()
+    g_diff = ((im[1,:,:] - gt_im[1,:,:])).bool()
+    b_diff = ((im[2,:,:] - gt_im[2,:,:])).bool()
+    color_mask = (r_diff | g_diff | b_diff)
 
     depth_sil_rendervar = transformed_params2depthplussilhouette(params, curr_data['w2c'],
                                                                  transformed_gaussians)
-    depth_sil_rendervar['scales'] = torch.clamp(depth_sil_rendervar['scales'],max = depth_sil_rendervar['scales'].mean())
+    depth_sil_rendervar['scales'] *= 0.7
 
     depth_sil, _, _, = Renderer(raster_settings=curr_data['cam'])(**depth_sil_rendervar)
     silhouette = depth_sil[1, :, :]

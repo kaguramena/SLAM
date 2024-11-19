@@ -114,7 +114,7 @@ def params2rendervar(params):
         'means3D': params['means3D'],
         'colors_precomp': params['rgb_colors'],
         'rotations': F.normalize(params['unnorm_rotations']),
-        'opacities': torch.sigmoid(params['logit_opacities']),
+        'opacities': torch.sigmoid(params['logit_rgb_opacities']),
         'scales': torch.exp(log_scales),
         'means2D': torch.zeros_like(params['means3D'], requires_grad=True, device="cuda") + 0
     }
@@ -132,7 +132,7 @@ def transformed_params2rendervar(params, transformed_gaussians):
         'means3D': transformed_gaussians['means3D'],
         'colors_precomp': params['rgb_colors'],
         'rotations': F.normalize(transformed_gaussians['unnorm_rotations']),
-        'opacities': torch.sigmoid(params['logit_opacities']),
+        'opacities': torch.sigmoid(0.0 * params['logit_rgb_opacities'] + 1.0 * params['logit_opacities']),
         'scales': torch.exp(log_scales),
         'means2D': torch.zeros_like(params['means3D'], requires_grad=True, device="cuda") + 0
     }
